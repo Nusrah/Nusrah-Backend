@@ -720,7 +720,7 @@ def update_campaign(campaign_id: str, data: dict):
     #   - active -> pending_bank_details     (details were just cleared/removed)
     # This runs regardless of whether the client also sent an explicit
     # "status" field, so the campaign can never end up active without bank
-    # details on file.
+    # details on file. Muzammil
     bank_fields_touched = any(
         k in data for k in ("bank_account_number", "bank_ifsc_code", "bank_name")
     )
