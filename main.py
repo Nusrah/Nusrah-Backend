@@ -14,9 +14,22 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
+# allow_origins=["*"] combined with allow_credentials=True is actually
+# invalid per the CORS spec — browsers refuse to honor credentialed
+# requests against a wildcard origin, so it never truly worked as intended.
+# ALLOWED_ORIGINS is a comma-separated env var, e.g.:
+#   ALLOWED_ORIGINS=https://nusrah.in,https://www.nusrah.in
+# Locally, it falls back to common Angular dev server ports so nothing
+# breaks if the env var isn't set yet.
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = (
+    [origin.strip() for origin in _allowed_origins_env.split(",") if origin.strip()]
+    or ["http://localhost:4200", "http://127.0.0.1:4200"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1263,12 +1276,13 @@ def _send_otp_email(clean_email: str, otp_code: str):
   """
   sender_email = "nusrah.support@gmail.com"
 
-  # =========================================================================
-  # REPLACE THE STRING BELOW WITH THE 16-CHARACTER GMAIL APP PASSWORD
-  # GENERATED FOR nusrah.support@gmail.com (the old password belonged to
-  # directdonate26@gmail.com and will NOT work for this new sender address).
-  # =========================================================================
-  app_password = "yhvv vfop fhsw pteu"
+  # Gmail app password is read from the environment, never hardcoded in
+  # source. Set GMAIL_APP_PASSWORD in your local .env file, and in your
+  # hosting platform's environment variables once deployed.
+  app_password = os.getenv("GMAIL_APP_PASSWORD")
+  if not app_password:
+    print("[forgot-password] GMAIL_APP_PASSWORD is not set — OTP email cannot be sent.")
+    return
 
   msg = MIMEMultipart("alternative")
   msg["Subject"] = "Your Nusrah verification code"
