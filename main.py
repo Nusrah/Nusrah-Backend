@@ -8,16 +8,23 @@ from email.mime.text import MIMEText
 from functools import wraps
 from inspect import iscoroutinefunction
 from typing import List, Optional
+
 import razorpay
 from database import supabase
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from chatbot import router as chatbot_router
+
 app = FastAPI()
+
 # Wildcard origins can't be used with credentials, so origins come from the comma-separated ALLOWED_ORIGINS env var (local Angular ports as fallback)
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:4200", "http://127.0.0.1:4200"]
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Nusrah chatbot (POST /api/chat)
+app.include_router(chatbot_router)
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, os.getenv("RAZORPAY_KEY_SECRET")))
@@ -78,6 +85,7 @@ def _safe(fn):
   # Turns unexpected errors into HTTP 500 and lets HTTPExceptions through (keeps sync/async so FastAPI runs it the same way)
   def to_http(e):
     return e if isinstance(e, HTTPException) else HTTPException(status_code=500, detail=str(e))
+
   if iscoroutinefunction(fn):
     @wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -153,7 +161,7 @@ def create_razorpay_qr_code(data: CreateQRRequest):
       "description": data.description,
       "close_by": int(time.time()) + 15 * 60,
       "notes": {"campaign_id": data.campaign_id},
-  })
+})
   return {k: qr.get(k) for k in ("id", "image_url", "payment_amount", "status", "close_by")} | {"success": True} if False else {
       "success": True,
       "qr_code_id": qr.get("id"),
@@ -161,7 +169,7 @@ def create_razorpay_qr_code(data: CreateQRRequest):
       "payment_amount": qr.get("payment_amount"),
       "status": qr.get("status"),
       "close_by": qr.get("close_by"),
-  }
+}
 
 @app.post("/api/verify-payment")
 def verify_razorpay_payment(data: VerifyPaymentRequest):
@@ -170,12 +178,12 @@ def verify_razorpay_payment(data: VerifyPaymentRequest):
         "razorpay_order_id": data.razorpay_order_id,
         "razorpay_payment_id": data.razorpay_payment_id,
         "razorpay_signature": data.razorpay_signature,
-    })
+})
     camp = supabase.table("campaigns").select("raised, goal, reach").eq("id", data.campaign_id).execute()
     if not camp.data:
       raise HTTPException(status_code=404, detail="Campaign not found")
     new_raised = float(camp.data[0].get("raised") or 0) + float(data.amount)
-    new_reach = int(camp.data[0].get("reach") or 0) + 1  # reach = completed donations (donor count shown on the donate page)
+    new_reach = int(camp.data[0].get("reach") or 0) + 1 # reach = completed donations (donor count shown on the donate page)
     supabase.table("campaigns").update({"raised": new_raised, "reach": new_reach}).eq("id", data.campaign_id).execute()
     supabase.table("donations").insert({"campaign_id": data.campaign_id, "amount": data.amount, "message": data.message or ""}).execute()
     return {"success": True, "message": "Payment verified and recorded successfully", "new_raised": new_raised, "new_reach": new_reach}
@@ -192,7 +200,7 @@ def get_stats():
       "active_campaigns": _count(table("campaigns").select("*", count="exact").ilike("status", "active")),
       "active_volunteers": _count(table("profiles").select("*", count="exact").ilike("role", "volunteer").ilike("approval_status", "approved")),
       "finished_campaigns": _count(table("campaigns").select("*", count="exact").ilike("status", "finished")),
-  }
+}
 
 @app.get("/api/home/campaigns")
 @_safe
@@ -278,7 +286,7 @@ async def create_campaign(
   if not profile_res.data:
     raise HTTPException(status_code=403, detail="Unauthorized user")
   profile = profile_res.data[0]
-  if profile.get("role", "").lower() == "admin":  # admins skip the approval queue but still need bank details to go live
+  if profile.get("role", "").lower() == "admin": # admins skip the approval queue but still need bank details to go live
     status = "active" if _campaign_has_bank_details(bank_account_number, bank_ifsc_code, bank_name) else "pending_bank_details"
   else:
     status = "pending"
@@ -307,7 +315,7 @@ async def create_campaign(
       "information": information,
       "category": category,
       "end_date": (end_date or "").strip() or None,
-  }).execute()
+}).execute()
   return {"message": "Campaign submitted successfully", "campaign": res.data}
 
 @app.put("/api/admin/campaigns/{campaign_id}/approve")
@@ -322,7 +330,7 @@ def approve_campaign(campaign_id: str):
       "message": "Campaign approved successfully" if status == "active" else "Campaign approved, but it needs bank details before it can go live",
       "status": status,
       "campaign": db_res.data,
-  }
+}
 
 @app.api_route("/api/admin/campaigns/{campaign_id}/assign-volunteers", methods=["PUT", "POST"])
 @_safe
@@ -484,7 +492,7 @@ def create_volunteer(data: dict):
       "photo_url": data.get("photo_url"),
       "role": "volunteer",
       "approval_status": data.get("approval_status", "approved"),
-  }).execute()
+}).execute()
   return {"message": "Volunteer added successfully", "volunteer": res.data}
 
 @app.put("/api/admin/volunteers/{volunteer_id}/approve")
@@ -549,41 +557,41 @@ def _send_otp_email(clean_email: str, otp_code: str):
       "Hello,\n\n"
       "We received a request to reset your password for your Nusrah account.\n\n"
       "Your verification code is:\n\n"
-      f"    {otp_code}\n\n"
+      f" {otp_code}\n\n"
       "This code will expire in 10 minutes. If you didn't request this, you can ignore this email.\n\n"
       "Nusrah Team",
       "plain",
-  ))
+))
   # Boxed digits use table cells because most email clients strip flexbox/grid
   digit_cells = "".join(
       f"""<td style="width: 44px; height: 54px; background: #ffffff; border: 2px solid #16a34a;
-               border-radius: 10px; text-align: center; vertical-align: middle;
-               font-family: 'Courier New', monospace; font-size: 26px; font-weight: bold;
-               color: #16a34a; padding: 0 4px;">{digit}</td>
-          <td style="width: 8px;"></td>"""
+border-radius: 10px; text-align: center; vertical-align: middle;
+font-family: 'Courier New', monospace; font-size: 26px; font-weight: bold;
+color: #16a34a; padding: 0 4px;">{digit}</td>
+<td style="width: 8px;"></td>"""
       for digit in otp_code
-  )
+)
   msg.attach(MIMEText(f"""
-    <div style="font-family: Arial, sans-serif; padding: 24px; color: #333; max-width: 480px; margin: 0 auto;">
-      <h2 style="margin-bottom: 4px;">Password reset request</h2>
-      <p>Hello,</p>
-      <p>We received a request to reset your password for your Nusrah account. Use the verification code below to continue.</p>
-      <div style="background: #f6f7f5; border-radius: 16px; padding: 24px 16px; margin: 20px 0; text-align: center;">
-        <p style="margin: 0 0 14px; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px;">Your verification code</p>
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
-          <tr>{digit_cells}</tr>
-        </table>
-        <p style="margin: 18px 0 6px; font-size: 12px; color: #6b7280;">Tap and hold the code below to select and copy it</p>
-        <p style="margin: 0; font-family: 'Courier New', monospace; font-size: 28px; font-weight: bold;
-                  letter-spacing: 8px; color: #16a34a; user-select: all;">{otp_code}</p>
-      </div>
-      <p>This code will expire in 10 minutes. If you didn't request this, you can safely ignore this email.</p>
-      <hr style="border: none; border-top: 1px solid #eee;" />
-      <p style="font-size: 12px; color: #777;">Nusrah Team</p>
-    </div>
-  """, "html"))
+<div style="font-family: Arial, sans-serif; padding: 24px; color: #333; max-width: 480px; margin: 0 auto;">
+<h2 style="margin-bottom: 4px;">Password reset request</h2>
+<p>Hello,</p>
+<p>We received a request to reset your password for your Nusrah account. Use the verification code below to continue.</p>
+<div style="background: #f6f7f5; border-radius: 16px; padding: 24px 16px; margin: 20px 0; text-align: center;">
+<p style="margin: 0 0 14px; font-size: 13px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px;">Your verification code</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
+<tr>{digit_cells}</tr>
+</table>
+<p style="margin: 18px 0 6px; font-size: 12px; color: #6b7280;">Tap and hold the code below to select and copy it</p>
+<p style="margin: 0; font-family: 'Courier New', monospace; font-size: 28px; font-weight: bold;
+letter-spacing: 8px; color: #16a34a; user-select: all;">{otp_code}</p>
+</div>
+<p>This code will expire in 10 minutes. If you didn't request this, you can safely ignore this email.</p>
+<hr style="border: none; border-top: 1px solid #eee;" />
+<p style="font-size: 12px; color: #777;">Nusrah Team</p>
+</div>
+""", "html"))
   try:
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:  # timeout stops a stalled connection from hanging forever
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server: # timeout stops a stalled connection from hanging forever
       server.login(sender, app_password)
       server.sendmail(sender, clean_email, msg.as_string())
   except Exception as e:
@@ -594,7 +602,7 @@ def forgot_password(data: ForgotPasswordRequest, background_tasks: BackgroundTas
   try:
     email = data.email.strip().lower()
     if not supabase.table("profiles").select("*").eq("email", email).execute().data:
-      raise HTTPException(status_code=404, detail="Email not registered.")  # frontend checks this 404 to show the register screen
+      raise HTTPException(status_code=404, detail="Email not registered.") # frontend checks this 404 to show the register screen
     otp_code = str(random.randint(100000, 999999))
     supabase.table("profiles").update({"reset_otp": otp_code, "otp_expires_at": int(time.time()) + 600}).eq("email", email).execute()
     background_tasks.add_task(_send_otp_email, email, otp_code)
@@ -639,5 +647,5 @@ def signup(data: SignupRequest):
       "photo_url": data.photo_url or "",
       "role": "volunteer",
       "approval_status": "pending",
-  }).execute()
+}).execute()
   return {"message": "Account created successfully", "profile": res.data}
