@@ -32,7 +32,15 @@ from database import supabase
 # Campaign data (public fields only, cached briefly so the chat stays fast)
 # --------------------------------------------------------------------------
 
-_PUBLIC_COLUMNS = "id, title, location, category, description, goal, raised, image_url, end_date, is_featured"
+# Column sets to try, best first. Your table may not have every optional column (for example
+# end_date), so instead of failing we fall back to a smaller set of public columns.
+_COLUMN_SETS = [
+    "id, title, location, category, description, goal, raised, image_url, end_date, is_featured",
+    "id, title, location, category, description, goal, raised, image_url, is_featured",
+    "id, title, location, category, description, goal, raised, image_url",
+    "id, title, location, description, goal, raised, image_url",
+]
+_working_columns: Optional[str] = None  # remembered after the first successful query
 _CACHE_TTL_SECONDS = 60
 _cache: Dict[str, Any] = {"time": 0.0, "data": []}
 
@@ -79,11 +87,29 @@ def _public_view(campaign: Dict[str, Any]) -> Dict[str, Any]:
 
 def list_active_campaigns() -> List[Dict[str, Any]]:
     """All active campaigns (public fields). Cached for a minute."""
+    global _working_columns
     now = time.time()
     if _cache["data"] and now - _cache["time"] < _CACHE_TTL_SECONDS:
         return _cache["data"]
-    res = supabase.table("campaigns").select(_PUBLIC_COLUMNS).ilike("status", "active").execute()
-    _cache["data"] = [_prepare(r) for r in (res.data or [])]
+
+    rows = None
+    last_error: Optional[Exception] = None
+    for columns in ([_working_columns] if _working_columns else _COLUMN_SETS):
+        try:
+            res = supabase.table("campaigns").select(columns).ilike("status", "active").execute()
+            rows = res.data or []
+            _working_columns = columns
+            break
+        except Exception as e:
+            last_error = e
+            print(f"[chatbot_rules] campaign query failed with columns '{columns}': {e}")
+            # only try a smaller column set when the problem is a missing column
+            if "42703" not in str(e) and "does not exist" not in str(e):
+                raise
+    if rows is None:
+        raise last_error if last_error else RuntimeError("Could not load campaigns")
+
+    _cache["data"] = [_prepare(r) for r in rows]
     _cache["time"] = now
     return _cache["data"]
 
@@ -435,7 +461,8 @@ def _campaign_search(topics: List[str], location: Optional[str], mode: Optional[
 
     try:
         results, exact = find_campaigns(topics, location, mode)
-    except Exception:
+    except Exception as e:
+        print(f"[chatbot_rules] campaign search failed: {e}")
         return _reply(
             "I couldn't load the campaigns just now. Please try again in a moment, or browse them directly.",
             links=[_PAGE_LINKS["campaigns"]],
