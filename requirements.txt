@@ -8,3 +8,5 @@ python-multipart==0.0.12
 setuptools<81
 httpx<0.28
 requests>=2.31.0
+bcrypt>=4.2.0
+PyJWT>=2.9.0
