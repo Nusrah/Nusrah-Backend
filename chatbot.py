@@ -115,7 +115,7 @@ def _default_reply() -> Dict[str, Any]:
 # --- Endpoint -----------------------------------------------------------------
 @router.post("")
 def chat(data: ChatRequest, request: Request):
-    visitor = request.client.host if request.client else "unknown"
+    visitor = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if _rate_limited(visitor):
         raise HTTPException(
             status_code=429,
