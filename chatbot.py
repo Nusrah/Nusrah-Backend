@@ -4,9 +4,11 @@ chatbot.py — the Nusrah chatbot API endpoint.
 POST /api/chat   body: {"message": "show masjid campaigns", "history": [{"role": "user", "content": "..."}]}
 
 How a question is answered:
-  1. chatbot_rules.answer()  -> instant, free, no API key. Handles most questions.
-  2. chatbot_llm.ask_llm()   -> AI fallback (Gemini free tier) for everything the rules don't understand.
-  3. A friendly default reply if the AI is unavailable, disabled, or over its daily cap.
+  1. chatbot_rules.answer(informational=False) -> instant and free: greetings, page navigation, the Zakah
+     calculator button and campaign search.
+  2. chatbot_llm.ask_llm()   -> the AI (Gemini) answers everything else, general questions included.
+  3. chatbot_rules.answer(informational=True) -> canned explanations if the AI is unavailable or over its daily cap.
+  4. A friendly default reply as the last resort.
 
 The AI part is optional: if chatbot_llm.py is empty, missing, or has no API key,
 the chatbot still works using the rules alone.
@@ -115,7 +117,8 @@ def _default_reply() -> Dict[str, Any]:
 # --- Endpoint -----------------------------------------------------------------
 @router.post("")
 def chat(data: ChatRequest, request: Request):
-    visitor = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    # request.client.host is the real client IP when uvicorn runs with --proxy-headers; the raw X-Forwarded-For header can be faked
+    visitor = request.client.host if request.client else "unknown"
     if _rate_limited(visitor):
         raise HTTPException(
             status_code=429,
@@ -126,16 +129,16 @@ def chat(data: ChatRequest, request: Request):
     if not message:
         raise HTTPException(status_code=422, detail="Message cannot be empty")
 
-    # 1) Rule-based answer: free and instant
+    # 1) Quick intents (greetings, navigation, Zakah calculator, campaign search): free and instant
     try:
-        rule_reply = chatbot_rules.answer(message)
+        rule_reply = chatbot_rules.answer(message, informational=False)
     except Exception as e:
         print(f"[chatbot] rules error: {e}")
         rule_reply = None
     if rule_reply is not None:
         return rule_reply
 
-    # 2) AI fallback for anything the rules didn't understand
+    # 2) The AI answers everything else
     ask_llm = getattr(chatbot_llm, "ask_llm", None) if chatbot_llm else None
     if ask_llm and _ai_budget_available():
         try:
@@ -147,5 +150,14 @@ def chat(data: ChatRequest, request: Request):
             # never show raw errors (they can contain keys or internal details) to visitors
             print(f"[chatbot] AI fallback error: {e}")
 
-    # 3) Friendly default
+    # 3) AI unavailable or over its daily cap: fall back to the canned explanations
+    try:
+        rule_reply = chatbot_rules.answer(message, informational=True)
+    except Exception as e:
+        print(f"[chatbot] rules error: {e}")
+        rule_reply = None
+    if rule_reply is not None:
+        return rule_reply
+
+    # 4) Friendly default
     return _default_reply()

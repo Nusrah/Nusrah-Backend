@@ -275,13 +275,50 @@ def search_campaigns(query: str, limit: int = _MAX_RESULTS) -> List[Dict[str, An
 # Site knowledge (also reused as context for the AI fallback)
 # --------------------------------------------------------------------------
 
-SITE_GUIDE = """Nusrah is a donation platform ("Aid that anchors you to Jannah") that connects donors directly with verified Masjids, orphanages, NGOs, schools, medical cases and community projects.
-Pages: Home (/), Campaigns (/campaigns), Donate to a campaign (/donate/<campaign id>), Login (/login), Register (/register), About (/about), Contact (/contact).
-Home page has a Zakah calculator (2.5% on cash, gold, silver, business assets and investments above the Nisab threshold, minus debts).
-Donating: open a campaign, press Donate Now, choose an amount and pay online (Razorpay) or via a UPI QR code.
-Starting a campaign: register or log in, submit the campaign form (title, location, category, goal, description, photos, verification documents, bank details). The Nusrah team reviews it; it goes live once approved and bank details are on file.
-Volunteers help verify campaigns; volunteer accounts are approved by the admin team.
-Every campaign is reviewed by the Nusrah team and volunteers before it is published, and organizers post progress updates."""
+# Temporary payment notice (mirrors the "Important Notice" popup on the home page).
+# Set PAYMENT_NOTICE and PAYMENT_NOTICE_SHORT to "" once the payment gateway is back.
+PAYMENT_NOTICE = (
+    "TEMPORARY NOTICE currently shown on the site: the online payment gateway is out of service. For now, the bank details shown on "
+    "each campaign belong to Nusrah, not to the individuals or organizations receiving the donations. Nusrah receives every donation "
+    "and passes it on to the people of that same campaign, so each contribution is tracked safely and transparently. This is only "
+    "temporary: once the gateway is restored, donors will be able to donate directly to the people in need."
+)
+PAYMENT_NOTICE_SHORT = (
+    "Please note: the online payment gateway is temporarily unavailable. For now, use the bank details shown on the campaign. "
+    "They belong to Nusrah, which passes your donation on to the people of that same campaign."
+)
+
+SITE_GUIDE = """Nusrah ("Aid that anchors you to Jannah") is a donation platform that connects donors directly with verified Masjids, orphanages, NGOs, schools, medical cases and community projects.
+
+PAGES (path: what it is)
+- Home (/): rotating hero with Qur'an verses (swipe on phones), live stats (active campaigns, active volunteers, finished campaigns), featured campaigns, a Zakah calculator section, and a welcome popup followed by an Important Notice popup when the site is opened.
+- Campaigns (/campaigns): browse all active campaigns.
+- Donate (/donate/<campaign id>): one campaign's page with its details, progress and the donate option.
+- Zakah calculator (/zakat): opens the calculator on the Home page.
+- Login (/login): sign in, with "Forgot password?" and a link to Register.
+- Register (/register): volunteer sign-up ("Join Our Team & Earn Sadaqah Jariyah"): explains the volunteer role and opens the registration form.
+- About (/about) and Contact (/contact).
+- Volunteer Portal and Admin Control Center: private dashboards that open after login, depending on the account's role.
+
+ZAKAH CALCULATOR
+Fields: cash on hand, gold value, silver value, business assets, investments and debts. Net wealth = assets minus debts. If net wealth reaches the Nisab threshold set in the calculator (Rs 45,000), Zakah is 2.5% of net wealth; otherwise the calculator shows nothing is due. It is only a guide, not a religious ruling. The real Nisab depends on current gold and silver prices, so suggest asking a qualified scholar for personal rulings.
+
+DONATING
+Open a campaign from the Campaigns page, press Donate Now and follow the payment options shown there (online payment, or UPI QR code / bank details). Donations are recorded on the campaign, so its progress bar grows.
+""" + PAYMENT_NOTICE + """
+
+VOLUNTEERS AND CAMPAIGNS
+- Every registration on the Register page creates a volunteer account. The admin team reviews and approves it; until then the person cannot log in. After approval they log in to the Volunteer Portal.
+- Volunteer Portal: a Profile tab (edit phone, city, bio, photo; change password) and a Campaigns tab. There volunteers can request a new campaign (title, location, category, goal, end date, detailed story, main photo, optional gallery, verification documents, optional UPI QR code and bank details), manage the campaigns assigned to them, upload progress photos and verification documents, update the raised amount, and add bank details when a campaign is listed under Needs Bank Details.
+- Campaign life cycle: submitted (pending) -> approved by the Nusrah admin team -> live (active) if bank details are on file, otherwise it waits under Needs Bank Details and stays hidden from donors until they are added -> finished.
+- Categories: Masjid Construction, Medical Aid, Education, Orphan Care, Widow & Family Support, Food & Ration Aid, Water Wells, Disaster Relief, Qurbani / Udhiya, Zakat & Sadaqah, Islamic Da'wah, General / Other.
+- Admin team: approves campaigns and volunteers, assigns volunteers to campaigns, features campaigns on the Home page and manages the platform.
+- Trust: every campaign is reviewed by the Nusrah team and volunteers before it is published, and progress updates are posted so donors can see the impact.
+
+ACCOUNT AND LOGIN
+Log in with email and password. Passwords must be at least 8 characters. "Forgot password?" on the login page emails a 6-digit code (valid 10 minutes) that lets the person set a new password. Logged-in users can change their password with the Change Password button in the dashboard navbar.
+
+NOT KNOWN (say you are not sure and suggest the Contact page): minimum donation amount, fees, refunds, tax receipts, phone numbers or email addresses of the team."""
 
 
 def _reply(
@@ -313,7 +350,28 @@ _PAGE_LINKS = {
     "login": {"label": "Log in", "path": "/login"},
     "register": {"label": "Create an account", "path": "/register"},
     "home": {"label": "Home page", "path": "/"},
+    "zakat": {"label": "Open Zakah calculator", "path": "/zakat"},
 }
+
+# Words in a message or reply -> page link to show under the answer (used for AI replies)
+_LINK_KEYWORDS = [
+    (r"\b(zakat|zakah|zakaat|nisab|nisaab)\b", "zakat"),
+    (r"\b(register|sign up|signup|create an account|join our team)\b", "register"),
+    (r"\b(log ?in|sign in|forgot password)\b", "login"),
+    (r"\bcontact\b", "contact"),
+    (r"\babout (page|nusrah)\b", "about"),
+    (r"\bcampaigns\b", "campaigns"),
+]
+
+
+def links_for_text(text: str, limit: int = 3) -> List[Dict[str, str]]:
+    """Page links that fit what was just said (e.g. a Zakah mention gets the calculator button)."""
+    lower = (text or "").lower()
+    links: List[Dict[str, str]] = []
+    for pattern, key in _LINK_KEYWORDS:
+        if re.search(pattern, lower) and _PAGE_LINKS[key] not in links:
+            links.append(_PAGE_LINKS[key])
+    return links[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -366,12 +424,17 @@ def _start_campaign() -> Dict[str, Any]:
 
 
 def _donate_how() -> Dict[str, Any]:
-    return _reply(
+    text = (
         "Donating is simple:\n"
         "1. Open Campaigns and pick a cause you'd like to support.\n"
         "2. Press Donate Now on the campaign.\n"
-        "3. Enter your amount and pay online, or scan the UPI QR code.\n"
-        "Your donation is recorded on the campaign right away, so you can watch its progress grow.",
+        "3. Follow the payment options shown there.\n"
+        "Your donation is recorded on the campaign, so you can watch its progress grow."
+    )
+    if PAYMENT_NOTICE_SHORT:
+        text += "\n" + PAYMENT_NOTICE_SHORT
+    return _reply(
+        text,
         links=[_PAGE_LINKS["campaigns"]],
         suggestions=["Show Masjid campaigns", "Show medical campaigns"],
     )
@@ -379,11 +442,11 @@ def _donate_how() -> Dict[str, Any]:
 
 def _zakat() -> Dict[str, Any]:
     return _reply(
-        "Our Zakah calculator is on the home page, in the \"Calculate Your Zakah\" section. Enter your cash, gold, silver, "
-        "business assets, investments and any immediate debts. It works out 2.5% if your net wealth reaches the Nisab "
-        "threshold.\n"
+        "Our Zakah calculator is on the home page. Enter your cash, gold, silver, business assets, investments and any "
+        "immediate debts, and it works out 2.5% if your net wealth reaches the Nisab threshold. Tap the button below and "
+        "I'll take you straight to it.\n"
         "The calculator is a helpful guide. For rulings specific to your situation, please check with a qualified scholar.",
-        links=[{"label": "Open the home page", "path": "/"}],
+        links=[_PAGE_LINKS["zakat"]],
         suggestions=["Show active campaigns", "How do I donate?"],
     )
 
@@ -424,6 +487,7 @@ def _contact() -> Dict[str, Any]:
 
 def _navigate(message_lower: str) -> Optional[Dict[str, Any]]:
     mapping = [
+        (r"\b(zakat|zakah|zakaat)\b", "zakat"),
         (r"\babout\b", "about"),
         (r"\bcontact\b", "contact"),
         (r"\b(login|log in|sign in)\b", "login"),
@@ -492,8 +556,19 @@ def _has(text: str, pattern: str) -> bool:
     return re.search(pattern, text) is not None
 
 
-def answer(message: str) -> Optional[Dict[str, Any]]:
-    """Returns a reply dict, or None if the rules don't understand the question."""
+_STRICT_SEARCH_VERBS = {
+    "show", "find", "search", "list", "looking", "look", "browse", "display", "recommend", "suggest", "available", "any",
+}
+
+
+def answer(message: str, informational: bool = True) -> Optional[Dict[str, Any]]:
+    """Returns a reply dict, or None if the rules don't understand the question.
+
+    informational=False -> only quick, certain intents: greetings, the help menu, page navigation, the Zakah
+    calculator button and campaign search. Everything else returns None so the AI can answer in its own words.
+    informational=True  -> also the canned explanations (how to donate, volunteers...). chatbot.py uses this as the
+    fallback when the AI is unavailable or over its daily limit.
+    """
     message = (message or "").strip()[:300]
     if not message:
         return _reply("Please type a question and I'll do my best to help.", suggestions=_DEFAULT_SUGGESTIONS)
@@ -503,40 +578,54 @@ def answer(message: str) -> Optional[Dict[str, Any]]:
     if not tokens:
         return None
 
-    # Greetings / thanks / goodbyes
+    # Greetings / thanks / goodbyes / help menu
     if len(tokens) <= 5 and all(t in _GREETING_WORDS for t in tokens):
         return _greeting(tokens)
-    if _has(lower, r"\b(thanks|thank you|thankyou|thx|jazakallah|jazak allah|shukran)\b"):
+    if len(tokens) <= 6 and _has(lower, r"\b(thanks|thank you|thankyou|thx|jazakallah|jazak allah|shukran)\b"):
         return _reply("You're welcome! JazakAllah khair. Let me know if there's anything else I can help with.")
-    if _has(lower, r"\b(bye|goodbye|see you|khuda hafiz|allah hafiz)\b"):
+    if len(tokens) <= 6 and _has(lower, r"\b(bye|goodbye|see you|khuda hafiz|allah hafiz)\b"):
         return _reply("Take care! Come back any time you need help. Assalamu alaikum.")
-    if _has(lower, r"\b(what can you do|what do you do|help me|menu|options|how can you help)\b") or lower in ("help", "?"):
+    if (
+        lower in ("help", "?")
+        or _has(lower, r"^(help me|menu|options)\W*$")
+        or _has(lower, r"\b(what can you do|what do you do|how can you help)\b")
+    ):
         return _capabilities()
 
-    # Informational questions
-    if _has(lower, r"\b(forgot|forget|reset|lost)\b.*\bpassword\b|\bpassword\b.*\b(forgot|reset|lost)\b"):
-        return _account()
-    if _has(lower, r"\b(start|create|begin|launch|open|submit|raise|make|post)\b.*\b(campaign|fundrais\w*|appeal)\b|\bfundrais\w*\b"):
-        return _start_campaign()
-    if _has(lower, r"\bhow\b.*\b(donate|give|pay|contribute|donation)\b|\b(payment|pay)\b.*\b(method|methods|option|options|upi|card)\b"):
-        return _donate_how()
-    if _has(lower, r"\b(zakat|zakah|zakaat|nisab|nisaab)\b"):
-        return _zakat()
-    if _has(lower, r"\bvolunteer\w*\b|\bjoin (our|the) team\b"):
-        return _volunteer()
-    if _has(lower, r"\b(verify|verified|verification|trust|trusted|safe|genuine|legit|fake|scam|transparen\w+)\b"):
-        return _verification()
-    if _has(lower, r"\b(what is|about|who (are|is))\b.*\b(nusrah|this (app|site|website|platform))\b|\bwhat is this\b"):
-        return _about()
-    if _has(lower, r"\b(login|log in|sign in|signin|register|sign up|signup|create (an )?account)\b") and not _has(
-        lower, r"\b(where|take me|go to|open|link)\b"
+    # Zakah calculator: "calculate my zakah", "open the zakat calculator", "take me to zakat"...
+    if _has(lower, r"\b(zakat|zakah|zakaat)\b") and _has(
+        lower, r"\b(calculat\w*|open|take me|go to|show|where|use|check|compute|work out|find)\b"
     ):
-        return _account()
-    if _has(lower, r"\b(contact|support|email|phone|reach (you|us)|helpdesk|help desk|complain\w*)\b"):
-        return _contact()
+        return _zakat()
+
+    # Canned explanations (skipped when the AI is available, so it can answer conversationally)
+    if informational:
+        if _has(lower, r"\b(forgot|forget|reset|lost)\b.*\bpassword\b|\bpassword\b.*\b(forgot|reset|lost)\b"):
+            return _account()
+        if _has(lower, r"\b(start|create|begin|launch|open|submit|raise|make|post)\b.*\b(campaign|fundrais\w*|appeal)\b|\bfundrais\w*\b"):
+            return _start_campaign()
+        if _has(lower, r"\bhow\b.*\b(donate|give|pay|contribute|donation)\b|\b(payment|pay)\b.*\b(method|methods|option|options|upi|card)\b"):
+            return _donate_how()
+        if _has(lower, r"\b(zakat|zakah|zakaat|nisab|nisaab)\b"):
+            return _zakat()
+        if _has(lower, r"\bvolunteer\w*\b|\bjoin (our|the) team\b"):
+            return _volunteer()
+        if _has(lower, r"\b(verify|verified|verification|trust|trusted|safe|genuine|legit|fake|scam|transparen\w+)\b"):
+            return _verification()
+        if _has(lower, r"\b(what is|about|who (are|is))\b.*\b(nusrah|this (app|site|website|platform))\b|\bwhat is this\b"):
+            return _about()
+        if _has(lower, r"\b(login|log in|sign in|signin|register|sign up|signup|create (an )?account)\b") and not _has(
+            lower, r"\b(where|take me|go to|open|link)\b"
+        ):
+            return _account()
+        if _has(lower, r"\b(contact|support|email|phone|reach (you|us)|helpdesk|help desk|complain\w*)\b"):
+            return _contact()
+
     if _has(lower, r"\bhow many\b.*\bcampaigns?\b"):
         return _count_campaigns()
-    if _has(lower, r"\b(where|take me|go to|open|navigate|link)\b"):
+
+    asking_how = _has(lower, r"\b(how|why)\b")
+    if (informational or not asking_how) and _has(lower, r"\b(where|take me|go to|open|navigate|link)\b"):
         nav = _navigate(lower)
         if nav:
             return nav
@@ -545,11 +634,20 @@ def answer(message: str) -> Optional[Dict[str, Any]]:
     topics = _detect_topics(tokens)
     location = _extract_location(lower)
     mode = _detect_mode(lower)
-    asks_for_campaigns = any(t.startswith("campaign") for t in tokens) or any(t in _SEARCH_VERBS for t in tokens)
-    if topics or mode or (location and asks_for_campaigns) or (
-        asks_for_campaigns and any(t.startswith("campaign") for t in tokens)
-    ):
+    campaign_word = any(t.startswith("campaign") for t in tokens)
+    if informational:
+        asks_for_campaigns = campaign_word or any(t in _SEARCH_VERBS for t in tokens)
+        wants_search = bool(topics or mode or (location and asks_for_campaigns) or (asks_for_campaigns and campaign_word))
+    else:
+        strict_verb = any(t in _STRICT_SEARCH_VERBS for t in tokens)
+        intent = campaign_word or strict_verb or len(tokens) <= 3
+        wants_search = not asking_how and bool(
+            (topics and intent) or (mode and (campaign_word or strict_verb)) or (location and campaign_word)
+        )
+        if wants_search and _has(lower, r"\b(start|create|begin|launch|raise)\b"):
+            wants_search = False  # "start a masjid campaign" is a how-to question, not a search
+    if wants_search:
         return _campaign_search(topics, location, mode)
 
-    # Not understood → the AI fallback (or a friendly default) takes over
+    # Not understood -> the AI (or, failing that, the canned answers and a friendly default) takes over
     return None
