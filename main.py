@@ -21,7 +21,13 @@ from auth import (
 )
 from chatbot import router as chatbot_router
 
-app = FastAPI()
+# API docs are for local development only; leave ENABLE_DOCS unset on Render
+ENABLE_DOCS = os.getenv("ENABLE_DOCS", "").strip().lower() == "true"
+app = FastAPI(
+  docs_url="/docs" if ENABLE_DOCS else None,
+  redoc_url="/redoc" if ENABLE_DOCS else None,
+  openapi_url="/openapi.json" if ENABLE_DOCS else None,
+)
 
 # Wildcard origins can't be used with credentials, so origins come from the comma-separated ALLOWED_ORIGINS env var (local Angular ports as fallback)
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:4200", "http://127.0.0.1:4200"]
@@ -91,6 +97,8 @@ BANK_FIELDS = ("bank_account_number", "bank_ifsc_code", "bank_name")
 PAYMENT_FIELDS = ("bank_account_name", "bank_account_number", "bank_name", "bank_ifsc_code", "upi_id", "upi_qr_code_url")
 ADMIN_ONLY_CAMPAIGN_FIELDS = ("status", "is_featured", "raised") # only admins may change these
 MIN_PASSWORD_LENGTH = 8
+MIN_DONATION_AMOUNT = 1 # rupees
+MAX_DONATION_AMOUNT = 10_000_000 # rupees; only a sanity limit so absurd values are rejected
 
 def _safe(fn):
   # Turns unexpected errors into HTTP 500 and lets HTTPExceptions through (keeps sync/async so FastAPI runs it the same way)
@@ -190,7 +198,20 @@ def read_root():
 @app.post("/api/create-order")
 @_safe
 def create_razorpay_order(data: CreateOrderRequest):
-  order = razorpay_client.order.create(data={"amount": int(data.amount * 100), "currency": "INR", "payment_capture": 1})
+  if not (MIN_DONATION_AMOUNT <= data.amount <= MAX_DONATION_AMOUNT):
+    raise HTTPException(status_code=400, detail="Please enter a valid donation amount.")
+  camp = supabase.table("campaigns").select("id, status").eq("id", data.campaign_id).execute().data
+  if not camp:
+    raise HTTPException(status_code=404, detail="Campaign not found")
+  if (camp[0].get("status") or "").strip().lower() != "active":
+    raise HTTPException(status_code=400, detail="This campaign is not accepting donations right now.")
+  # The campaign id is stored on the order itself so verify-payment can trust it instead of the browser
+  order = razorpay_client.order.create(data={
+      "amount": int(round(data.amount * 100)),
+      "currency": "INR",
+      "payment_capture": 1,
+      "notes": {"campaign_id": data.campaign_id},
+})
   return {"success": True, "order_id": order["id"], "amount": order["amount"], "currency": order["currency"], "key_id": RAZORPAY_KEY_ID}
 
 @app.post("/api/create-qr-code")
@@ -215,26 +236,76 @@ def create_razorpay_qr_code(data: CreateQRRequest):
       "close_by": qr.get("close_by"),
 }
 
+def _fetch_captured_payment(payment_id: str) -> dict:
+  # Asks Razorpay itself (not the browser) about the payment. Auto-capture can take a moment, so retry briefly.
+  payment = {}
+  for attempt in range(3):
+    payment = razorpay_client.payment.fetch(payment_id)
+    status = payment.get("status")
+    if status == "captured":
+      return payment
+    if status in ("failed", "refunded"):
+      break
+    if attempt < 2:
+      time.sleep(1)
+  raise HTTPException(status_code=400, detail="This payment has not been completed.")
+
 @app.post("/api/verify-payment")
 def verify_razorpay_payment(data: VerifyPaymentRequest):
+  # 1. The signature proves the order id and payment id really came from Razorpay's checkout
   try:
     razorpay_client.utility.verify_payment_signature({
         "razorpay_order_id": data.razorpay_order_id,
         "razorpay_payment_id": data.razorpay_payment_id,
         "razorpay_signature": data.razorpay_signature,
 })
-    camp = supabase.table("campaigns").select("raised, goal, reach").eq("id", data.campaign_id).execute()
-    if not camp.data:
-      raise HTTPException(status_code=404, detail="Campaign not found")
-    new_raised = float(camp.data[0].get("raised") or 0) + float(data.amount)
-    new_reach = int(camp.data[0].get("reach") or 0) + 1 # reach = completed donations (donor count shown on the donate page)
-    supabase.table("campaigns").update({"raised": new_raised, "reach": new_reach}).eq("id", data.campaign_id).execute()
-    supabase.table("donations").insert({"campaign_id": data.campaign_id, "amount": data.amount, "message": data.message or ""}).execute()
-    return {"success": True, "message": "Payment verified and recorded successfully", "new_raised": new_raised, "new_reach": new_reach}
   except razorpay.errors.SignatureVerificationError:
     raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
+  # 2. Amount and campaign come from Razorpay's own records, never from the request body
+  try:
+    order = razorpay_client.order.fetch(data.razorpay_order_id)
+    payment = _fetch_captured_payment(data.razorpay_payment_id)
+  except HTTPException:
+    raise
   except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
+    print(f"[verify-payment] Could not confirm payment {data.razorpay_payment_id} with Razorpay: {e}")
+    raise HTTPException(status_code=502, detail="We could not confirm your payment with Razorpay. If money was deducted, please contact support with your payment ID.")
+  if payment.get("order_id") != data.razorpay_order_id or payment.get("currency") != "INR":
+    raise HTTPException(status_code=400, detail="Payment does not match this order.")
+  notes = order.get("notes") if isinstance(order.get("notes"), dict) else {}
+  campaign_id = notes.get("campaign_id")
+  if not campaign_id or str(campaign_id) != str(data.campaign_id):
+    raise HTTPException(status_code=400, detail="This payment does not belong to this campaign.")
+  amount = int(payment["amount"]) / 100 # Razorpay amounts are in paise
+
+  if not supabase.table("campaigns").select("id").eq("id", campaign_id).execute().data:
+    raise HTTPException(status_code=404, detail="Campaign not found")
+
+  # 3. Record it once. record_donation (see donations_idempotency.sql) inserts the donation and updates the campaign totals
+  #    in a single database transaction, and a unique index on razorpay_payment_id makes a repeat submission a harmless no-op.
+  try:
+    res = supabase.rpc("record_donation", {
+        "p_campaign_id": campaign_id,
+        "p_amount": amount,
+        "p_message": data.message or "",
+        "p_payment_id": data.razorpay_payment_id,
+        "p_order_id": data.razorpay_order_id,
+}).execute()
+    row = res.data[0] if isinstance(res.data, list) else res.data
+    if not row:
+      raise RuntimeError("record_donation returned no result")
+  except Exception as e:
+    print(f"[verify-payment] Could not record payment {data.razorpay_payment_id}: {e}")
+    raise HTTPException(status_code=500, detail="Your payment went through but we could not record it. Please contact support with your payment ID.")
+  already = bool(row.get("already_recorded"))
+  return {
+      "success": True,
+      "message": "This donation was already recorded." if already else "Payment verified and recorded successfully",
+      "already_recorded": already,
+      "new_raised": float(row.get("new_raised") or 0),
+      "new_reach": int(row.get("new_reach") or 0),
+}
 
 @app.get("/api/stats")
 @_safe
