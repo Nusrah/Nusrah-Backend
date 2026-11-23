@@ -803,16 +803,17 @@ def forgot_password(data: ForgotPasswordRequest, background_tasks: BackgroundTas
       raise HTTPException(status_code=429, detail="Too many requests. Please try again in 15 minutes.")
     record_attempt(ip_key)
     record_attempt(email_key)
-    if not supabase.table("profiles").select("*").eq("email", email).execute().data:
-      raise HTTPException(status_code=404, detail="Email not registered.") # frontend checks this 404 to show the register screen
-    otp_code = str(100000 + secrets.randbelow(900000))
-    supabase.table("profiles").update({"reset_otp": otp_code, "otp_expires_at": int(time.time()) + 600}).eq("email", email).execute()
-    background_tasks.add_task(_send_otp_email, email, otp_code)
-    return {"success": True, "message": "OTP sent successfully to your email."}
+    # The response is identical whether or not the email is registered, so this endpoint can't be used to find out who has an account
+    if supabase.table("profiles").select("id").eq("email", email).execute().data:
+      otp_code = str(100000 + secrets.randbelow(900000))
+      supabase.table("profiles").update({"reset_otp": otp_code, "otp_expires_at": int(time.time()) + 600}).eq("email", email).execute()
+      background_tasks.add_task(_send_otp_email, email, otp_code)
+    return {"success": True, "message": "If this email is registered, a verification code has been sent to it."}
   except HTTPException:
     raise
   except Exception as e:
-    raise HTTPException(status_code=500, detail=f"Failed to process OTP request: {str(e)}")
+    print(f"[forgot-password] Failed to process request: {e}")
+    raise HTTPException(status_code=500, detail="Failed to process OTP request. Please try again.")
 
 @app.post("/api/auth/reset-password")
 @_safe
@@ -824,9 +825,11 @@ def reset_password(data: ResetPasswordRequest):
   new_password = _clean_password(data.new_password)
   res = supabase.table("profiles").select("*").eq("email", email).execute()
   if not res.data:
-    raise HTTPException(status_code=404, detail="User not found.")
+    # Same answer as a wrong code, so an unknown email can't be told apart from a known one
+    record_attempt(fail_key)
+    raise HTTPException(status_code=400, detail="Invalid OTP code.")
   user = res.data[0]
-  stored_otp = str(user.get("reset_otp", ""))
+  stored_otp = str(user.get("reset_otp") or "")
   expires_at = int(user.get("otp_expires_at") or 0)
   if not stored_otp or not secrets.compare_digest(stored_otp.encode(), data.otp.strip().encode()):
     record_attempt(fail_key)
