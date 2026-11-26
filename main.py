@@ -311,10 +311,14 @@ def verify_razorpay_payment(data: VerifyPaymentRequest):
 @_safe
 def get_stats():
   table = supabase.table
+  rows = table("campaigns").select("location, status").execute().data or []
+  live = [r for r in rows if (r.get("status") or "").strip().lower() in ("active", "finished")]
+  communities = {(r.get("location") or "").strip().lower() for r in live if (r.get("location") or "").strip()}
   return {
       "active_campaigns": _count(table("campaigns").select("*", count="exact").ilike("status", "active")),
       "active_volunteers": _count(table("profiles").select("*", count="exact").ilike("role", "volunteer").ilike("approval_status", "approved")),
       "finished_campaigns": _count(table("campaigns").select("*", count="exact").ilike("status", "finished")),
+      "communities_supported": len(communities),
 }
 
 @app.get("/api/home/campaigns")
