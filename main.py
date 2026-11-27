@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import smtplib
@@ -13,6 +14,7 @@ import razorpay
 from database import supabase
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from auth import (
@@ -31,6 +33,30 @@ app = FastAPI(
 
 # Wildcard origins can't be used with credentials, so origins come from the comma-separated ALLOWED_ORIGINS env var (local Angular ports as fallback)
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:4200", "http://127.0.0.1:4200"]
+# Upload limits. The dashboards show people the same rules before they upload.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_DOC_BYTES = 8 * 1024 * 1024
+MAX_GALLERY_IMAGES = 10
+MAX_DOCS_PER_REQUEST = 5
+MAX_DOCS_PER_CAMPAIGN = 15
+MAX_UPLOAD_REQUEST_BYTES = 110 * 1024 * 1024 # worst case: a new campaign with a cover, 10 gallery images, 5 documents and a QR code
+MAX_JSON_REQUEST_BYTES = 1_000_000
+
+class RequestSizeLimitMiddleware:
+  # Turns away oversized requests by their Content-Length header before the body is read
+  def __init__(self, app, upload_limit: int, json_limit: int):
+    self.app, self.upload_limit, self.json_limit = app, upload_limit, json_limit
+
+  async def __call__(self, scope, receive, send):
+    if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "PATCH"):
+      headers = dict(scope["headers"])
+      length = headers.get(b"content-length", b"")
+      limit = self.upload_limit if headers.get(b"content-type", b"").startswith(b"multipart/form-data") else self.json_limit
+      if length.isdigit() and int(length) > limit:
+        return await JSONResponse({"detail": "That request is too large."}, status_code=413)(scope, receive, send)
+    await self.app(scope, receive, send)
+
+app.add_middleware(RequestSizeLimitMiddleware, upload_limit=MAX_UPLOAD_REQUEST_BYTES, json_limit=MAX_JSON_REQUEST_BYTES)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Nusrah chatbot (POST /api/chat)
@@ -65,9 +91,6 @@ class ChangePasswordRequest(BaseModel):
   current_password: str
   new_password: str
 
-class ProgressRequest(BaseModel):
-  raised: float
-
 class DeleteDocRequest(BaseModel):
   file_url: Optional[str] = None
   url: Optional[str] = None
@@ -91,11 +114,13 @@ class CreateQRRequest(BaseModel):
   name: Optional[str] = "Campaign Donation"
   description: Optional[str] = "Donation for campaign"
 
-CAMPAIGN_FIELDS = ("title", "location", "description", "information", "category", "goal", "raised", "status", "is_featured", "featured_highlights", "additional_images", "bank_account_name", "bank_account_number", "bank_name", "upi_id")
+CAMPAIGN_FIELDS = ("title", "location", "description", "information", "category", "goal", "status", "is_featured", "featured_highlights", "additional_images", "bank_account_name", "bank_account_number", "bank_name", "upi_id")
 CAMPAIGN_ALIASES = (("document_proofs", ("document_proofs", "verification_docs")), ("bank_ifsc_code", ("bank_ifsc_code", "ifsc_code")), ("upi_qr_code_url", ("upi_qr_code_url", "qr_code_url")))
 BANK_FIELDS = ("bank_account_number", "bank_ifsc_code", "bank_name")
 PAYMENT_FIELDS = ("bank_account_name", "bank_account_number", "bank_name", "bank_ifsc_code", "upi_id", "upi_qr_code_url")
 ADMIN_ONLY_CAMPAIGN_FIELDS = ("status", "is_featured", "raised") # only admins may change these
+# Only these columns are ever sent to anonymous visitors. New columns stay private by default.
+PUBLIC_CAMPAIGN_FIELDS = ("id", "title", "description", "information", "category", "location", "goal", "raised", "status", "is_featured", "featured_highlights", "additional_images", "image_url", "reach", "budget", "end_date", "created_at")
 MIN_PASSWORD_LENGTH = 8
 MIN_DONATION_AMOUNT = 1 # rupees
 MAX_DONATION_AMOUNT = 10_000_000 # rupees; only a sanity limit so absurd values are rejected
@@ -146,16 +171,80 @@ def _campaigns(query):
     _sync_docs(c)
   return campaigns
 
+def _public_campaigns(query):
+  # Public (no-login) view: never include bank/UPI details, verification documents or owner ids.
+  return [{k: c[k] for k in PUBLIC_CAMPAIGN_FIELDS if k in c} for c in (query.execute().data or [])]
+
 def _profile_update(data, fields):
   u = {k: data.get(k) for k in fields if k in data}
+  if u.get("photo_url") and not _is_own_file_url(u["photo_url"]): # profile photos only come from the upload endpoint
+    u.pop("photo_url")
   if "name" in data or "full_name" in data:
     u["full_name"] = data.get("name") or data.get("full_name")
   return u
 
-async def _upload(f: UploadFile, prefix="", ext="jpg", ctype="image/jpeg"):
-  name = f"{prefix}{uuid.uuid4()}.{f.filename.split('.')[-1] if f.filename else ext}"
+UPLOAD_MIME = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "pdf": "application/pdf"}
+UPLOAD_ALLOWED = {"image": ("jpg", "png", "webp"), "doc": ("pdf", "jpg", "png", "webp")}
+UPLOAD_HINT = {"image": "a JPG, PNG or WebP image", "doc": "a PDF, JPG, PNG or WebP file"}
+STORAGE_PUBLIC_PREFIX = (os.getenv("SUPABASE_URL") or "").strip().strip("'\"").rstrip("/") + "/storage/v1/object/public/"
+
+def _is_own_file_url(url) -> bool:
+  # True only for links to files in this project's own Supabase storage
+  return isinstance(url, str) and url.startswith(STORAGE_PUBLIC_PREFIX)
+
+def _as_list(value):
+  if isinstance(value, str):
+    try:
+      value = json.loads(value)
+    except ValueError:
+      return []
+  return value if isinstance(value, list) else []
+
+def _keep_known_files(new, current):
+  # Files are only added through the upload endpoints, so an edit may keep or remove links but not invent new ones
+  known = set(_as_list(current))
+  return [x for x in _as_list(new) if x in known or _is_own_file_url(x)]
+
+def _detect_type(head: bytes):
+  # Works out what a file really is from its first bytes, never from its name or the browser's content-type
+  if head.startswith(b"\xff\xd8\xff"):
+    return "jpg"
+  if head.startswith(b"\x89PNG\r\n\x1a\n"):
+    return "png"
+  if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+    return "webp"
+  if head.startswith(b"%PDF-"):
+    return "pdf"
+  return None
+
+def _file_size(f: UploadFile) -> int:
+  pos = f.file.tell()
+  f.file.seek(0, 2)
+  size = f.file.tell()
+  f.file.seek(pos)
+  return size
+
+async def _check_file(f: UploadFile, kind="image"):
+  # Returns (extension, mime type) for a real, allowed, small-enough file; otherwise raises a clear error before anything is stored
+  label = (f.filename or "file")[:60]
+  size = _file_size(f)
+  if size == 0:
+    raise HTTPException(status_code=400, detail=f"{label} is empty.")
+  limit = MAX_IMAGE_BYTES if kind == "image" else MAX_DOC_BYTES
+  if size > limit:
+    raise HTTPException(status_code=413, detail=f"{label} is too large. The limit is {limit // (1024 * 1024)} MB per file.")
+  head = await f.read(16)
+  await f.seek(0)
+  ext = _detect_type(head)
+  if ext not in UPLOAD_ALLOWED[kind]:
+    raise HTTPException(status_code=400, detail=f"{label} is not allowed. Please upload {UPLOAD_HINT[kind]}.")
+  return ext, UPLOAD_MIME[ext]
+
+async def _upload(f: UploadFile, prefix="", kind="image"):
+  ext, mime = await _check_file(f, kind)
+  name = f"{prefix}{uuid.uuid4()}.{ext}"
   bucket = supabase.storage.from_("campaign-images")
-  bucket.upload(name, await f.read(), file_options={"content-type": f.content_type or ctype})
+  bucket.upload(name, await f.read(), file_options={"content-type": mime})
   return bucket.get_public_url(name)
 
 def _clean_password(raw: str) -> str:
@@ -324,12 +413,12 @@ def get_stats():
 @app.get("/api/home/campaigns")
 @_safe
 def get_home_campaigns():
-  return {"campaigns": _campaigns(supabase.table("campaigns").select("*").eq("is_featured", True).ilike("status", "active"))}
+  return {"campaigns": _public_campaigns(supabase.table("campaigns").select("*").eq("is_featured", True).ilike("status", "active"))}
 
 @app.get("/api/campaigns")
 @_safe
 def get_all_campaigns():
-  return {"campaigns": _campaigns(supabase.table("campaigns").select("*").ilike("status", "active"))}
+  return {"campaigns": _public_campaigns(supabase.table("campaigns").select("*").ilike("status", "active"))}
 
 @app.get("/api/admin/campaigns", dependencies=[Depends(require_admin)])
 @_safe
@@ -409,10 +498,20 @@ async def create_campaign(
     status = "active" if _campaign_has_bank_details(bank_account_number, bank_ifsc_code, bank_name) else "pending_bank_details"
   else:
     status = "pending"
+  additional_files = [f for f in additional_files if f.filename][:MAX_GALLERY_IMAGES]
+  verification_docs = [f for f in verification_docs if f.filename]
+  has_qr = upi_qr_code is not None and bool(upi_qr_code.filename)
+  if len(verification_docs) > MAX_DOCS_PER_REQUEST:
+    raise HTTPException(status_code=400, detail=f"You can upload at most {MAX_DOCS_PER_REQUEST} documents at a time.")
+  # Check every file first so one bad file is rejected before anything gets stored
+  for f in [file, *additional_files, *([upi_qr_code] if has_qr else [])]:
+    await _check_file(f)
+  for f in verification_docs:
+    await _check_file(f, "doc")
   image_url = await _upload(file)
-  additional_images = [await _upload(f) for f in additional_files[:10]]
-  doc_urls = [await _upload(f, "proof-", "bin", "application/octet-stream") for f in verification_docs]
-  qr_url = await _upload(upi_qr_code, "qr-") if upi_qr_code is not None and upi_qr_code.filename else None
+  additional_images = [await _upload(f) for f in additional_files]
+  doc_urls = [await _upload(f, "proof-", "doc") for f in verification_docs]
+  qr_url = await _upload(upi_qr_code, "qr-") if has_qr else None
   res = supabase.table("campaigns").insert({
       "title": title,
       "location": location,
@@ -486,6 +585,16 @@ def update_campaign(campaign_id: str, data: dict, user: dict = Depends(get_curre
     src = next((s for s in sources if s in data), None)
     if src:
       u[dest] = data.get(src)
+  # Files are only added through the upload endpoints, so these fields can keep or remove links but not accept new outside ones
+  guarded = [k for k in ("additional_images", "document_proofs", "upi_qr_code_url") if k in u]
+  if guarded:
+    cur = (supabase.table("campaigns").select(", ".join(guarded)).eq("id", campaign_id).execute().data or [{}])[0]
+    for k in guarded:
+      if k == "upi_qr_code_url":
+        if u[k] and u[k] != cur.get(k) and not _is_own_file_url(u[k]):
+          u.pop(k)
+      else:
+        u[k] = _keep_known_files(u[k], cur.get(k))
   if not is_admin:
     for k in ADMIN_ONLY_CAMPAIGN_FIELDS:
       u.pop(k, None)
@@ -509,13 +618,6 @@ def update_campaign(campaign_id: str, data: dict, user: dict = Depends(get_curre
   res = supabase.table("campaigns").update(u).eq("id", campaign_id).execute()
   return {"message": "Campaign updated successfully", "campaign": res.data}
 
-@app.put("/api/campaigns/{campaign_id}/progress")
-@_safe
-def update_campaign_progress(campaign_id: str, data: ProgressRequest, user: dict = Depends(get_current_user)):
-  _require_campaign_manager(user, campaign_id)
-  res = supabase.table("campaigns").update({"raised": data.raised}).eq("id", campaign_id).execute()
-  return {"message": "Progress updated successfully", "campaign": res.data}
-
 @app.post("/api/campaigns/{campaign_id}/upload-photo")
 @_safe
 async def upload_campaign_photo(campaign_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -538,11 +640,10 @@ async def upload_campaign_gallery(campaign_id: str, files: List[UploadFile] = Fi
   _require_campaign_manager(user, campaign_id)
   res = supabase.table("campaigns").select("additional_images").eq("id", campaign_id).execute()
   current = (res.data[0].get("additional_images") if res.data else None) or []
-  new_urls = []
+  files = [f for f in files if f.filename][:max(0, MAX_GALLERY_IMAGES - len(current))]
   for f in files:
-    if len(current) + len(new_urls) >= 10:
-      break
-    new_urls.append(await _upload(f))
+    await _check_file(f)
+  new_urls = [await _upload(f) for f in files]
   images = current + new_urls
   db_res = supabase.table("campaigns").update({"additional_images": images}).eq("id", campaign_id).execute()
   return {"message": "Gallery updated successfully", "additional_images": images, "campaign": db_res.data}
@@ -573,7 +674,15 @@ async def upload_verification_docs(
   res = supabase.table("campaigns").select("id, document_proofs").eq("id", campaign_id).execute()
   if not res.data:
     raise HTTPException(status_code=404, detail="Campaign not found")
-  docs = (res.data[0].get("document_proofs") or []) + [await _upload(f, "proof-", "bin", "application/octet-stream") for f in all_files]
+  current_docs = _as_list(res.data[0].get("document_proofs"))
+  all_files = [f for f in all_files if f.filename]
+  if not all_files:
+    raise HTTPException(status_code=422, detail="No files provided for upload")
+  if len(all_files) > MAX_DOCS_PER_REQUEST or len(current_docs) + len(all_files) > MAX_DOCS_PER_CAMPAIGN:
+    raise HTTPException(status_code=400, detail=f"You can upload at most {MAX_DOCS_PER_REQUEST} documents at a time, and {MAX_DOCS_PER_CAMPAIGN} per campaign.")
+  for f in all_files:
+    await _check_file(f, "doc")
+  docs = current_docs + [await _upload(f, "proof-", "doc") for f in all_files]
   db_res = supabase.table("campaigns").update({"document_proofs": docs}).eq("id", campaign_id).execute()
   return {"message": "Verification documents uploaded successfully", "verification_docs": docs, "campaign": db_res.data}
 
@@ -626,7 +735,7 @@ def create_volunteer(data: dict):
       "phone": data.get("phone"),
       "city": data.get("city"),
       "bio": data.get("bio"),
-      "photo_url": data.get("photo_url"),
+      "photo_url": data.get("photo_url") if _is_own_file_url(data.get("photo_url")) else None,
       "role": "volunteer",
       "approval_status": data.get("approval_status", "approved"),
 }).execute()
@@ -859,7 +968,7 @@ def signup(data: SignupRequest):
       "phone": data.phone,
       "city": data.city,
       "bio": data.bio or "",
-      "photo_url": data.photo_url or "",
+      "photo_url": "", # photos are added through the upload endpoint, not by pasting a link
       "role": "volunteer",
       "approval_status": "pending",
 }).execute()
