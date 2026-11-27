@@ -117,8 +117,9 @@ class CreateQRRequest(BaseModel):
 CAMPAIGN_FIELDS = ("title", "location", "description", "information", "category", "goal", "status", "is_featured", "featured_highlights", "additional_images", "bank_account_name", "bank_account_number", "bank_name", "upi_id")
 CAMPAIGN_ALIASES = (("document_proofs", ("document_proofs", "verification_docs")), ("bank_ifsc_code", ("bank_ifsc_code", "ifsc_code")), ("upi_qr_code_url", ("upi_qr_code_url", "qr_code_url")))
 BANK_FIELDS = ("bank_account_number", "bank_ifsc_code", "bank_name")
+CONTENT_FIELDS = ("title", "location", "description", "information", "category", "goal", "end_date", "additional_images", "document_proofs") # volunteers can't change these once a campaign is live
 PAYMENT_FIELDS = ("bank_account_name", "bank_account_number", "bank_name", "bank_ifsc_code", "upi_id", "upi_qr_code_url")
-ADMIN_ONLY_CAMPAIGN_FIELDS = ("status", "is_featured", "raised") # only admins may change these
+ADMIN_ONLY_CAMPAIGN_FIELDS = ("status", "is_featured", "featured_highlights", "raised") # only admins may change these
 # Only these columns are ever sent to anonymous visitors. New columns stay private by default.
 PUBLIC_CAMPAIGN_FIELDS = ("id", "title", "description", "information", "category", "location", "goal", "raised", "status", "is_featured", "featured_highlights", "additional_images", "image_url", "reach", "budget", "end_date", "created_at")
 MIN_PASSWORD_LENGTH = 8
@@ -277,8 +278,13 @@ def _require_campaign_manager(user, campaign_id):
 
 def _require_payment_edit(user, camp):
   # Once a campaign is live, where the money goes can only be changed by an admin
-  if user["role"] != "admin" and camp.get("status") not in ("pending", "pending_bank_details"):
+  if user["role"] != "admin" and (camp.get("status") or "").strip().lower() not in ("pending", "pending_bank_details"):
     raise HTTPException(status_code=403, detail="Payment details of a live campaign can only be changed by an admin")
+
+def _require_content_edit(user, camp):
+  # Once a campaign is live, its text, photos and documents can only be changed by an admin
+  if user["role"] != "admin" and (camp.get("status") or "").strip().lower() not in ("pending", "pending_bank_details"):
+    raise HTTPException(status_code=403, detail="This campaign is live. Please ask an admin to make changes.")
 
 @app.get("/")
 def read_root():
@@ -604,15 +610,17 @@ def update_campaign(campaign_id: str, data: dict, user: dict = Depends(get_curre
         u.pop(k)
     if any(k in u for k in PAYMENT_FIELDS):
       _require_payment_edit(user, camp)
+    if any(k in u for k in CONTENT_FIELDS):
+      _require_content_edit(user, camp)
   # Re-check bank details whenever one is touched so a campaign can never be active without them
   if any(k in data for k in BANK_FIELDS):
     cur = supabase.table("campaigns").select("status, " + ", ".join(BANK_FIELDS)).eq("id", campaign_id).execute().data
     if cur:
       cur = cur[0]
       has_bank = _campaign_has_bank_details(*(u.get(k, cur.get(k)) for k in BANK_FIELDS))
-      status = u.get("status", cur.get("status"))
+      status = str(u.get("status", cur.get("status")) or "").strip().lower()
       if status == "pending_bank_details" and has_bank:
-        u["status"] = "active"
+        u["status"] = "active" if is_admin else "pending" # a volunteer's bank details go to an admin for review before the campaign goes live
       elif status == "active" and not has_bank:
         u["status"] = "pending_bank_details"
   res = supabase.table("campaigns").update(u).eq("id", campaign_id).execute()
@@ -621,7 +629,7 @@ def update_campaign(campaign_id: str, data: dict, user: dict = Depends(get_curre
 @app.post("/api/campaigns/{campaign_id}/upload-photo")
 @_safe
 async def upload_campaign_photo(campaign_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-  _require_campaign_manager(user, campaign_id)
+  _require_content_edit(user, _require_campaign_manager(user, campaign_id))
   image_url = await _upload(file)
   res = supabase.table("campaigns").update({"image_url": image_url}).eq("id", campaign_id).execute()
   return {"message": "Photo updated successfully", "image_url": image_url, "campaign": res.data}
@@ -637,7 +645,7 @@ async def upload_campaign_qr_code(campaign_id: str, file: UploadFile = File(...)
 @app.post("/api/campaigns/{campaign_id}/upload-gallery")
 @_safe
 async def upload_campaign_gallery(campaign_id: str, files: List[UploadFile] = File(...), user: dict = Depends(get_current_user)):
-  _require_campaign_manager(user, campaign_id)
+  _require_content_edit(user, _require_campaign_manager(user, campaign_id))
   res = supabase.table("campaigns").select("additional_images").eq("id", campaign_id).execute()
   current = (res.data[0].get("additional_images") if res.data else None) or []
   files = [f for f in files if f.filename][:max(0, MAX_GALLERY_IMAGES - len(current))]
@@ -662,7 +670,7 @@ async def upload_verification_docs(
     document: Optional[UploadFile] = File(default=None),
     user: dict = Depends(get_current_user),
 ):
-  _require_campaign_manager(user, campaign_id)
+  _require_content_edit(user, _require_campaign_manager(user, campaign_id))
   all_files = [*(verification_docs or []), *(files or []), *([file] if file else []), *(documents or []), *([document] if document else [])]
   if not all_files:
     try:
@@ -690,7 +698,7 @@ async def upload_verification_docs(
 @app.api_route("/api/admin/campaigns/{campaign_id}/delete-verification-doc", methods=["POST", "DELETE", "PUT"], dependencies=[Depends(require_admin)])
 @_safe
 async def delete_verification_doc(campaign_id: str, request: Request, data: Optional[DeleteDocRequest] = None, user: dict = Depends(get_current_user)):
-  _require_campaign_manager(user, campaign_id)
+  _require_content_edit(user, _require_campaign_manager(user, campaign_id))
   file_url = None
   try:
     body = await request.json()
